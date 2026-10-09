@@ -1,0 +1,52 @@
+name: Publish Container Image
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "Dockerfile"
+      - "rust-toolchain"
+      - ".github/workflows/container-publish.yml"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata for container image
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}-dev
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+      - name: Build and push container image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Pull and smoke test published container image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}-dev:latest"
+          echo "Pulling published image: $IMAGE"
+          docker pull "$IMAGE"
+          
+          echo "Running smoke test against test_fixtures/smoke_test/ inside container"
+          OUTPUT=$(docker run --rm -v "$(pwd)/test_fixtures/smoke_test:/workspace/smoke_test" -w /workspace/smoke_test "$IMAGE" cargo cost-lint --format json 2>&1 || true)
+          echo "Container output:"
+          echo "$OUTPUT"
+          
+          echo "Asserting expected findings are present..."
+          echo "$OUTPUT" | grep -q "soroban_storage_in_loop"

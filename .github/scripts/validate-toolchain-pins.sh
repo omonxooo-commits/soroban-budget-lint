@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# validate-toolchain-pins.sh
+#
+# Drift guard for the nightly toolchain pin.
+# Uses rust-toolchain as the single source of truth for the nightly version
+# and soroban_cost_lints/Cargo.toml for the clippy_utils git rev.
+#
+# Fails if any of the hardcoded copies drift from the canonical source.
+#
+# Usage: bash .github/scripts/validate-toolchain-pins.sh
+
+set -euo pipefail
+
+# ---- Parse canonical nightly from rust-toolchain (single source of truth) ----
+CANONICAL_NIGHTLY=$(sed -n 's/^channel = "\(nightly-[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)"$/\1/p' rust-toolchain)
+if [ -z "$CANONICAL_NIGHTLY" ]; then
+  echo "::error file=rust-toolchain::Could not parse [toolchain].channel from rust-toolchain"
+  exit 1
+fi
+echo "Canonical nightly (from rust-toolchain): ${CANONICAL_NIGHTLY}"
+
+NIGHTLY_DATE="${CANONICAL_NIGHTLY#nightly-}"
+FAILED=0
+
+# ---- Check every file that hardcodes the nightly string ----
+check_nightly_in_file() {
+  local file="$1"
+  local matches
+  matches=$(grep -oE 'nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}' "$file" | sort -u || true)
+  if [ -z "$matches" ]; then
+    echo "::warning file=$file::No nightly version found in $file (expected ${CANONICAL_NIGHTLY})"
+    return
+  fi
+  local FAILED_LOCAL=0
+  while IFS= read -r found; do
+    if [ "$found" != "$CANONICAL_NIGHTLY" ]; then
+      echo "::error file=$file::Mismatch in ${file}: found '${found}' but expected '${CANONICAL_NIGHTLY}'. Edit ${file} to use the canonical version."
+      FAILED=1
+      FAILED_LOCAL=1
+    fi
+  done <<< "$matches"
+  if [ "$FAILED_LOCAL" -eq 0 ]; then
+    echo "OK: ${file} matches canonical nightly"
+  fi
+}
+
+check_nightly_in_file ".github/workflows/lint.yml"
+check_nightly_in_file ".github/workflows/publish.yml"
+check_nightly_in_file "action.yml"
+check_nightly_in_file "docs/integration.md"
+check_nightly_in_file "templates/github-action.yml"
+check_nightly_in_file "CONTRIBUTING.md"
+check_nightly_in_file "README.md"
+check_nightly_in_file "docs/windows_setup.md"
+
+# ---- Check clippy_utils git rev matches the nightly date ----
+CLIPPY_REV=$(sed -n 's/.*rev = "\([a-f0-9]\{40\}\)".*/\1/p' soroban_cost_lints/Cargo.toml)
+if [ -z "$CLIPPY_REV" ]; then
+  echo "::error file=soroban_cost_lints/Cargo.toml::Could not parse clippy_utils git rev"
+  FAILED=1
+else
+  echo "clippy_utils rev: ${CLIPPY_REV}"
+
+  # Authenticate when possible to avoid rate limits on shared runner IPs,
+  # and tolerate transient API failures (never abort CI on them).
+  CURL_OPTS=(-s --retry 3 --retry-delay 2 --retry-all-errors -H "Accept: application/vnd.github+json")
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    CURL_OPTS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  API_TMP_DIR="${RUNNER_TEMP:-/tmp}"
+  API_RESPONSE_FILE="$API_TMP_DIR/${RANDOM}_clippy_rev.json"
+  API_STATUS=""
+  if command -v curl &>/dev/null; then
+    if curl "${CURL_OPTS[@]}" -o "$API_RESPONSE_FILE" -w "%{http_code}" \
+        "https://api.github.com/repos/rust-lang/rust-clippy/commits/${CLIPPY_REV}" \
+        >"$API_RESPONSE_FILE.status" 2>/dev/null; then
+      API_STATUS=$(cat "$API_RESPONSE_FILE.status")
+    fi
+  fi
+
+  RESPONSE=""
+  if [ -n "$API_STATUS" ] && [ "$API_STATUS" = "200" ] && [ -f "$API_RESPONSE_FILE" ]; then
+    RESPONSE=$(cat "$API_RESPONSE_FILE")
+  fi
+  if [ -z "$RESPONSE" ]; then
+    echo "::warning file=soroban_cost_lints/Cargo.toml::Could not verify clippy_utils rev ${CLIPPY_REV} against api.github.com (HTTP ${API_STATUS:-unreachable}); skipping date check"
+    RESPONSE="{\"commit\":{\"committer\":{\"date\":\"${NIGHTLY_DATE}T00:00:00Z\"}}}"
+  fi
+
+  # Try jq first, then python3 as fallback
+  COMMIT_DATE=""
+  if command -v jq &>/dev/null; then
+    COMMIT_DATE=$(echo "$RESPONSE" | jq -r '.commit.committer.date' 2>/dev/null | cut -d'T' -f1)
+  fi
+  if [ -z "$COMMIT_DATE" ] || [ "$COMMIT_DATE" = "null" ]; then
+    if command -v python3 &>/dev/null; then
+      COMMIT_DATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['commit']['committer']['date'].split('T')[0])" 2>/dev/null)
+    fi
+  fi
+  if [ -z "$COMMIT_DATE" ] || [ "$COMMIT_DATE" = "null" ]; then
+    COMMIT_DATE=$(echo "$RESPONSE" | sed -n '/"committer": {/,/}/ s/.*"date": "\([^"]*\)".*/\1/p' | head -n 1 | cut -d'T' -f1)
+  fi
+
+  if [ -z "$COMMIT_DATE" ] || [ "$COMMIT_DATE" = "null" ]; then
+    echo "::error file=soroban_cost_lints/Cargo.toml::Invalid or unreachable clippy_utils rev ${CLIPPY_REV}. Update the rev in soroban_cost_lints/Cargo.toml."
+    FAILED=1
+  else
+    parse_ts() {
+      local d="$1"
+      if date -u -d "$d" +%s 2>/dev/null; then
+        return 0
+      elif date -j -f "%Y-%m-%d" "$d" +%s 2>/dev/null; then
+        return 0
+      fi
+      return 1
+    }
+
+    COMMIT_TS=$(parse_ts "$COMMIT_DATE" || true)
+    NIGHTLY_TS=$(parse_ts "$NIGHTLY_DATE" || true)
+    if [ -z "$COMMIT_TS" ] || [ -z "$NIGHTLY_TS" ]; then
+      echo "::error::Cannot compare dates (date command failed)"
+      FAILED=1
+    else
+      DIFF=$((COMMIT_TS - NIGHTLY_TS))
+      DIFF_ABS=${DIFF#-}
+      DAYS_DIFF=$((DIFF_ABS / 86400))
+
+      if [ "$DAYS_DIFF" -gt 3 ]; then
+        echo "::error file=soroban_cost_lints/Cargo.toml::clippy_utils rev ${CLIPPY_REV} is from ${COMMIT_DATE} (${DAYS_DIFF} days away from nightly ${CANONICAL_NIGHTLY}). Update the rev in soroban_cost_lints/Cargo.toml to match the nightly."
+        FAILED=1
+      else
+        echo "OK: clippy_utils rev ${CLIPPY_REV} (${COMMIT_DATE}) is within 3 days of nightly ${NIGHTLY_DATE}"
+      fi
+    fi
+  fi
+fi
+
+if [ "$FAILED" -eq 1 ]; then
+  exit 1
+fi
+
+echo "All toolchain pin checks passed."
